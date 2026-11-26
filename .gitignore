@@ -2,3 +2,4 @@ node_modules
 rug_components
 dist
 *.local
+dev/photos

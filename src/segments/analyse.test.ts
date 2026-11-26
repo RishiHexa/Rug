@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { analyseRug } from './analyse';
+import { analyseRug, evenLight, findBandEdges, lightSlope, SIDES } from './analyse';
 import { shapeMask } from './cutout';
 import { boundsOf, close, countOf, dilate, erode, fillHoles, maskFrom, open, parts, quarterVote } from './mask';
 import type { Pixels } from './pixels';
@@ -20,6 +20,23 @@ function picture(width: number, height: number, color: (x: number, y: number) =>
     }
   }
   return { data, width, height };
+}
+
+const toLinear = (c: number) => (c / 255 <= 0.04045 ? c / 255 / 12.92 : ((c / 255 + 0.055) / 1.055) ** 2.4);
+const toByte = (v: number) => Math.round(255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055));
+
+/** The picture under uneven light: `light` of 1 leaves a pixel as it is. */
+function shade(px: Pixels, light: (x: number, y: number) => number): Pixels {
+  const data = new Uint8ClampedArray(px.data.length);
+  for (let y = 0; y < px.height; y++) {
+    for (let x = 0; x < px.width; x++) {
+      const p = (y * px.width + x) * 4;
+      const k = light(x, y);
+      for (let j = 0; j < 3; j++) data[p + j] = toByte(toLinear(px.data[p + j]!) * k);
+      data[p + 3] = px.data[p + 3]!;
+    }
+  }
+  return { data, width: px.width, height: px.height };
 }
 
 describe('masks', () => {
@@ -169,5 +186,58 @@ describe('reading a rug picture', () => {
     expect(f.pendants?.top).toBeTruthy();
     expect(f.pendants?.bottom).toBeTruthy();
     expect(f.pendants!.top.box.y + f.pendants!.top.box.height).toBeLessThanOrEqual(m.y + 2);
+  });
+
+  it('leaves an evenly lit picture as it is', () => {
+    expect(evenLight(px).pixels).toBe(px);
+  });
+
+  describe('in a photo lit from below', () => {
+    // Half as much light at the top as at the bottom.
+    const shaded = shade(px, (_, y) => 0.5 + 0.5 * (y / H));
+    const dim = analyseRug(shaded);
+
+    it('sees the light fall off and evens it out', () => {
+      const slope = lightSlope(shaded);
+      expect(Math.exp(slope.y)).toBeGreaterThan(1.6);
+      expect(Math.abs(slope.x)).toBeLessThan(0.05);
+      expect(dim.field.notes[0]).toMatch(/lighter at the bottom/);
+    });
+
+    it('still finds one ground, the spandrels and the pendants', () => {
+      const f = dim.field;
+      expect(f.quartered).toBe(true);
+      expect(f.spandrel).not.toBeNull();
+      expect(f.pocket).not.toBeNull();
+      expect(f.medallion).not.toBeNull();
+      expect(f.pendants?.bottom).toBeTruthy();
+    });
+  });
+});
+
+describe('band edges', () => {
+  // Red, then blue, then a gold field, divided by dark lines 3 px wide whose
+  // middles are at 31 and 61. The color change is stronger on one side of
+  // each line than the other.
+  const RED: RGB = [150, 55, 45];
+  const BLUE: RGB = [95, 125, 150];
+  const GOLD: RGB = [195, 150, 80];
+  const LINE: RGB = [45, 35, 40];
+  const px = picture(300, 300, (x, y) => {
+    const d = Math.min(x, y, 299 - x, 299 - y);
+    if (d < 30) return RED;
+    if (d < 33) return LINE;
+    if (d < 60) return BLUE;
+    if (d < 63) return LINE;
+    return GOLD;
+  });
+
+  it('sit in the middle of the dark lines dividing the bands', () => {
+    const edges = findBandEdges(px);
+    expect(edges).toHaveLength(2);
+    for (const side of SIDES) {
+      expect(Math.abs(edges[0]![side] - 31)).toBeLessThanOrEqual(1);
+      expect(Math.abs(edges[1]![side] - 61)).toBeLessThanOrEqual(1);
+    }
   });
 });

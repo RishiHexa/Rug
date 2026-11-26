@@ -7,11 +7,12 @@
  */
 import { createRandom, kMeans, assignNearest } from '../domain/clustering';
 import { linearToOklab, oklabToHex, SRGB_TO_LINEAR, type Oklab } from '../domain/color';
-import { LIGHT_WEIGHT, smoothLab, yarnDistance } from './cutout';
+import { LIGHT_WEIGHT, nearColors, smoothLab, yarnDistance } from './cutout';
 import {
   and,
   boundsOf,
   close,
+  countOf,
   crop,
   dilate,
   emptyMask,
@@ -352,6 +353,47 @@ function bestMap(profile: Float32Array, reference: Float32Array, most: number): 
   return best;
 }
 
+/** How much darker than either side a dividing line is. */
+const LINE_DARKER = 0.03;
+/** A dividing line is at most this wide, in pixels at analysis size. */
+const LINE_WIDEST = 6;
+
+/**
+ * Bands are usually divided by a thin dark line. An edge found as a color
+ * change lands on one side of it or the other, depending on which side
+ * changes more; for the edge to sit on the line the eye sees, it is moved to
+ * the middle of a dark line within `near` of it, when there is one.
+ */
+function onLine(profile: Float32Array, at: number, near: number): number | null {
+  const n = profile.length / 3;
+  const L = (d: number) => profile[Math.max(0, Math.min(n - 1, d)) * 3]!;
+  let best: number | null = null;
+  let bestDepth = LINE_DARKER;
+  for (let d = Math.max(1, at - near); d <= Math.min(n - 2, at + near); d++) {
+    if (L(d) > L(d - 1) || L(d) > L(d + 1)) continue;
+    // Lighter on both sides within a line's width.
+    let left = 0;
+    let right = 0;
+    for (let w = 1; w <= LINE_WIDEST; w++) {
+      left = Math.max(left, L(d - w) - L(d));
+      right = Math.max(right, L(d + w) - L(d));
+    }
+    const depth = Math.min(left, right);
+    if (depth > bestDepth) {
+      bestDepth = depth;
+      best = d;
+    }
+  }
+  if (best === null) return null;
+  // Middle of the dark run, for a line a few pixels wide.
+  const floor = L(best) + bestDepth * 0.35;
+  let lo = best;
+  let hi = best;
+  while (lo > 0 && best - lo < LINE_WIDEST && L(lo - 1) <= floor) lo--;
+  while (hi < n - 1 && hi - best < LINE_WIDEST && L(hi + 1) <= floor) hi++;
+  return Math.round((lo + hi) / 2);
+}
+
 /** Change that counts as a new band. */
 const EDGE_STEP = 0.03;
 const MAX_EDGES = 9;
@@ -411,7 +453,7 @@ export function findBandEdges(px: Pixels): BandEdge[] {
     const near = Math.max(2, Math.floor(spacing / 2));
     let best = guess;
     for (let e = guess - near; e <= guess + near; e++) if ((own[s]![e] ?? 0) > (own[s]![best] ?? 0)) best = e;
-    return best;
+    return onLine(profiles[s]!, best, near) ?? best;
   };
   const edges = picked
     .sort((a, b) => a - b)
@@ -750,6 +792,89 @@ function regionOf(mask: Mask, fieldBox: Rect, scale: number): Region | null {
   };
 }
 
+/** Big shapes are redrawn at most this size. */
+const REFINE_SIDE = 720;
+
+/**
+ * A big shape found on the small field picture, drawn again at the picture's
+ * own size. At the small size one pixel covers several knots, so the outline
+ * comes out as a staircase, and a motif standing a few knots off the shape
+ * looks joined to it. Here the ground between them shows, and only the shape
+ * itself (its biggest piece, holes filled) is kept. The outline may move a
+ * little either way from the small one, no further.
+ *
+ * A shape mirrored both ways about `center` (a medallion in a quartered
+ * field) is then voted over its four mirror images, keeping what at least two
+ * agree on. At full size a motif can touch the shape in one corner only, or
+ * a gap in one corner's frame can let the ground in; neither survives a vote.
+ */
+function refineRegion(
+  px: Pixels,
+  region: Region,
+  field: Rect,
+  groundColors: Oklab[],
+  tolerance: number,
+  center?: { x: number; y: number },
+): Region {
+  const b = region.box;
+  const pad = Math.max(4, Math.round(Math.max(b.width, b.height) * 0.04));
+  let x0 = Math.max(field.x, Math.floor(b.x - pad));
+  let y0 = Math.max(field.y, Math.floor(b.y - pad));
+  let x1 = Math.min(field.x + field.width, Math.ceil(b.x + b.width + pad));
+  let y1 = Math.min(field.y + field.height, Math.ceil(b.y + b.height + pad));
+  if (center) {
+    // The same reach either side of the middle, so every mirror image is in view.
+    const rx = Math.max(center.x - x0, x1 - center.x);
+    const ry = Math.max(center.y - y0, y1 - center.y);
+    x0 = Math.max(field.x, Math.floor(center.x - rx));
+    x1 = Math.min(field.x + field.width, Math.ceil(center.x + rx));
+    y0 = Math.max(field.y, Math.floor(center.y - ry));
+    y1 = Math.min(field.y + field.height, Math.ceil(center.y + ry));
+  }
+  const area: Rect = { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+  if (area.width < 8 || area.height < 8) return region;
+  const { pixels: cp, scale: s } = shrinkPixels(cropPixels(px, area), REFINE_SIDE);
+  const w = cp.width;
+  const h = cp.height;
+  // The small outline, at this size.
+  const coarse = maskFrom(w, h, (i) => {
+    const u = Math.floor(((x0 + (i % w) / s - b.x) / b.width) * region.mask.width);
+    const v = Math.floor(((y0 + Math.floor(i / w) / s - b.y) / b.height) * region.mask.height);
+    return u >= 0 && v >= 0 && u < region.mask.width && v < region.mask.height && region.mask.data[v * region.mask.width + u] === 1;
+  });
+  // How far the small outline can be off: about one of its pixels.
+  const slack = Math.max(2, Math.round((Math.max(b.width, b.height) / Math.max(region.mask.width, region.mask.height)) * s * 1.5));
+  const lab = smoothLab(cp, 1);
+  const shape = open(not(nearColors(lab, w, h, groundColors, tolerance)), 1);
+  const near = and(shape, dilate(coarse, slack));
+  const pp = parts(near);
+  const biggest = pp.parts.reduce<(typeof pp.parts)[number] | null>((m, p) => (!m || p.area > m.area ? p : m), null);
+  if (!biggest) return region;
+  let mask = fillHoles(partMask(pp.labels, w, h, [biggest.id]));
+  if (center) {
+    const filled = mask;
+    const at = (x: number, y: number) => {
+      const u = Math.round((x - x0) * s);
+      const v = Math.round((y - y0) * s);
+      return u >= 0 && v >= 0 && u < w && v < h ? filled.data[v * w + u]! : 0;
+    };
+    const voted = maskFrom(w, h, (i) => {
+      const x = x0 + (i % w) / s;
+      const y = y0 + Math.floor(i / w) / s;
+      const mx = 2 * center.x - x;
+      const my = 2 * center.y - y;
+      return filled.data[i]! + at(mx, y) + at(x, my) + at(mx, my) >= 2;
+    });
+    const vp = parts(voted);
+    const main = vp.parts.reduce<(typeof vp.parts)[number] | null>((m, p) => (!m || p.area > m.area ? p : m), null);
+    if (main) mask = fillHoles(partMask(vp.labels, w, h, [main.id]));
+  }
+  const r = boundsOf(mask);
+  // A redraw that lost most of the shape is a misreading; keep the small one.
+  if (!r || countOf(mask) < countOf(coarse) * 0.5) return region;
+  return { box: { x: x0 + r.x / s, y: y0 + r.y / s, width: r.width / s, height: r.height / s }, mask: crop(mask, r) };
+}
+
 function analyseField(px: Pixels, box: Rect, debug?: Record<string, Mask>): FieldInfo {
   const { pixels: fp, scale } = shrinkPixels(cropPixels(px, box), FIELD_SIDE);
   const W = fp.width;
@@ -801,7 +926,10 @@ function analyseField(px: Pixels, box: Rect, debug?: Record<string, Mask>): Fiel
     spreadCount++;
   }
   const tolerance = Math.min(0.07, Math.max(0.035, 2.2 * Math.sqrt(spread / Math.max(1, spreadCount))));
-  if (debug) debug.ground = groundMask;
+  if (debug) {
+    debug.ground = groundMask;
+    k.centroids.forEach((_, c) => (debug[`cluster${c}`] = maskFrom(W, H, (i) => k.labels[i] === c)));
+  }
 
   // Spandrels: a second color owning all four corners.
   const cw = W * 0.3;
@@ -826,11 +954,15 @@ function analyseField(px: Pixels, box: Rect, debug?: Record<string, Mask>): Fiel
       return !groundSet.has(c) && inCorners >= 0.03 && inCorners >= elsewhere * 1.8 ? [c] : [];
     }),
   );
+  const mainCorner = [...cornered].sort((a, b) => cornerCounts[b]! - cornerCounts[a]!)[0];
+  // The lit and shaded sides of the same gold pile cluster apart, and the
+  // other shade is often used elsewhere too, so it fails the corner test on
+  // its own. It is the same yarn all the same.
+  if (mainCorner !== undefined) for (const c of sameAs(k, mainCorner)) if (!groundSet.has(c)) cornered.add(c);
   const perCorner = corners.map((r) => {
     const h = histogram([r]);
     return [...cornered].reduce((n, c) => n + h[c]!, 0) / (cw * ch);
   });
-  const mainCorner = [...cornered].sort((a, b) => cornerCounts[b]! - cornerCounts[a]!)[0];
   notes.push(
     `Colors: ${k.centroids.map((c, i) => `${oklabToHex(c)} ${Math.round(k.shares[i]! * 100)}%`).join(', ')}.`,
     `Ground ${oklabToHex(ground)}; corner colors ${[...cornered].map((c) => oklabToHex(k.centroids[c]!)).join(' ') || 'none'} cover ${perCorner.map((v) => Math.round(v * 100) + '%').join(' ')}.`,
@@ -842,12 +974,16 @@ function analyseField(px: Pixels, box: Rect, debug?: Record<string, Mask>): Fiel
   if (mainCorner !== undefined && perCorner.filter((v) => v >= 0.2).length >= 3) {
     spandrelColor = k.centroids[mainCorner]!;
     spandrelColorMask = vote(majority(maskFrom(W, H, (i) => cornered.has(k.labels[i]!)), 1));
-    const sealed = close(spandrelColorMask, Math.max(1, Math.round(W * 0.012)));
-    if (debug) debug.spandrelColor = sealed;
     // Only color that reaches into a corner; gold elsewhere (inside a
     // medallion, say) is not a spandrel.
     const touching = (r: Rect) => (p: { box: Rect }) =>
       p.box.x < r.x + r.width && p.box.x + p.box.width > r.x && p.box.y < r.y + r.height && p.box.y + p.box.height > r.y;
+    // Sealed from the big corner areas alone: small gold flowers scattered
+    // over the ground would otherwise be bridged into a wall across it.
+    const gold = parts(spandrelColorMask);
+    const large = gold.parts.filter((p) => p.area >= area * 0.005 && corners.some((r) => touching(r)(p)));
+    const sealed = close(partMask(gold.labels, W, H, large.map((p) => p.id)), Math.max(1, Math.round(W * 0.012)));
+    if (debug) debug.spandrelColor = sealed;
     const sp = parts(sealed);
     const inCorner = sp.parts.filter((p) => p.area >= area * 0.01 && corners.some((r) => touching(r)(p)));
     const barrier = partMask(sp.labels, W, H, inCorner.map((p) => p.id));
@@ -946,6 +1082,13 @@ function analyseField(px: Pixels, box: Rect, debug?: Record<string, Mask>): Fiel
     if (topMask || bottomMask) pendantMask = or(topMask ?? none, bottomMask ?? none);
   }
 
+  // Outlines of the big shapes, at full size.
+  const groundColors = [...groundSet].map((c) => k.centroids[c]!);
+  const sharpen = (r: Region) => refineRegion(px, r, box, groundColors, tolerance);
+  const middle = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  if (medallion) medallion = refineRegion(px, medallion, box, groundColors, tolerance, quartered ? middle : undefined);
+  if (pendants) pendants = { top: sharpen(pendants.top), bottom: pendants.bottom && sharpen(pendants.bottom) };
+
   // Small motifs on the ground. They are only a few pixels across at the
   // size above, so they are looked for again in more detail, in one quarter
   // when the field is quartered.
@@ -989,20 +1132,102 @@ export interface RugAnalysis {
   field: FieldInfo;
 }
 
+// ---------------------------------------------------------------- light
+
+/** Linear light (0..1, in 8192 steps) to an sRGB byte. */
+const LINEAR_TO_BYTE = Uint8ClampedArray.from({ length: 8193 }, (_, i) => {
+  const v = i / 8192;
+  return Math.round(255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * v ** (1 / 2.4) - 0.055));
+});
+
+/** Light falling off by less than this across the picture is left alone. */
+const EVEN_ENOUGH = Math.log(1.06);
+
+/**
+ * How the light falls across the picture: log brightness rising by `x` from
+ * the left edge to the right, and by `y` from top to bottom. A rug's design
+ * is mirrored about its middle, so it has no such slope of its own; any slope
+ * is the lighting. Fitted on the middle of the picture, clear of the floor.
+ */
+export function lightSlope(px: Pixels): { x: number; y: number } {
+  const { width, height, data } = px;
+  const step = Math.max(1, Math.round(Math.min(width, height) / 300));
+  // Same number of samples either side of the middle, so the slopes separate.
+  const half = (n: number) => Math.floor((n * 0.42) / step) * step;
+  const hx = half(width);
+  const hy = half(height);
+  const mx = Math.floor(width / 2);
+  const my = Math.floor(height / 2);
+  let sux = 0;
+  let suu = 0;
+  let svy = 0;
+  let svv = 0;
+  for (let y = my - hy; y <= my + hy; y += step) {
+    for (let x = mx - hx; x <= mx + hx; x += step) {
+      const p = (y * width + x) * 4;
+      const lum =
+        0.2126 * SRGB_TO_LINEAR[data[p]!]! + 0.7152 * SRGB_TO_LINEAR[data[p + 1]!]! + 0.0722 * SRGB_TO_LINEAR[data[p + 2]!]!;
+      const g = Math.log(lum + 0.004);
+      const u = (x - mx) / width;
+      const v = (y - my) / height;
+      sux += u * g;
+      suu += u * u;
+      svy += v * g;
+      svv += v * v;
+    }
+  }
+  return { x: suu > 0 ? sux / suu : 0, y: svv > 0 ? svy / svv : 0 };
+}
+
+/**
+ * The picture as if lit evenly. A photo lit from one side makes one yarn look
+ * like two colors, lighter at one end of the rug: the ground then seems to
+ * change part way down, and a spandrel's gold only matches in two corners.
+ */
+export function evenLight(px: Pixels): { pixels: Pixels; slope: { x: number; y: number } } {
+  const slope = lightSlope(px);
+  if (Math.max(Math.abs(slope.x), Math.abs(slope.y)) < EVEN_ENOUGH) return { pixels: px, slope };
+  const { width, height, data } = px;
+  const out = new Uint8ClampedArray(data.length);
+  for (let y = 0; y < height; y++) {
+    const row = slope.y * (y / height - 0.5);
+    for (let x = 0; x < width; x++) {
+      const k = 8192 * Math.exp(-(row + slope.x * (x / width - 0.5)));
+      const p = (y * width + x) * 4;
+      for (let j = 0; j < 3; j++) out[p + j] = LINEAR_TO_BYTE[Math.min(8192, Math.round(SRGB_TO_LINEAR[data[p + j]!]! * k))]!;
+      out[p + 3] = data[p + 3]!;
+    }
+  }
+  return { pixels: { width, height, data: out }, slope };
+}
+
 /**
  * Everything at once. `edges` are band edges in picture pixels, outermost
  * first; found automatically when left out.
  */
-export function analyseRug(px: Pixels, edges?: BandEdge[], debug?: Record<string, Mask>): RugAnalysis {
+export function analyseRug(picture: Pixels, edges?: BandEdge[], debug?: Record<string, Mask>): RugAnalysis {
+  const { pixels: px, slope } = evenLight(picture);
   const short = Math.min(px.width, px.height);
   const fits = (e: BandEdge) => SIDES.every((s) => e[s] > 0) && Math.max(e.top + e.bottom, e.left + e.right) < short - 8;
-  const margin = edges ? edgeAt(0) : findMargin(px);
+  // Edges are found on the picture as taken: an edge is a sharp local change,
+  // which uneven light barely moves, and evening it out would make the four
+  // sides' profiles line up less well with each other.
+  const margin = edges ? edgeAt(0) : findMargin(picture);
   const clear = (e: BandEdge) => SIDES.every((side) => e[side] > margin[side] + 3);
-  let lines = (edges ?? findBandEdges(px)).filter((e) => fits(e) && (edges !== undefined || clear(e)));
+  let lines = (edges ?? findBandEdges(picture)).filter((e) => fits(e) && (edges !== undefined || clear(e)));
   if (!edges && lines.length > 1 && depthOf(lines[0]!) - depthOf(margin) < short * MARGIN_SHARE) lines = lines.slice(1);
   if (!edges) lines = dropSliver(px, mergeBands(px, lines, margin), margin);
   const bands = classifyBands(px, lines, margin);
   const e = lines.at(-1) ?? margin;
   const box = { x: e.left, y: e.top, width: px.width - e.left - e.right, height: px.height - e.top - e.bottom };
-  return { width: px.width, height: px.height, margin, bands, field: analyseField(px, box, debug) };
+  const field = analyseField(px, box, debug);
+  if (px !== picture) {
+    const pct = (s: number) => Math.round((Math.exp(Math.abs(s)) - 1) * 100);
+    const words = [
+      slope.y !== 0 && `${pct(slope.y)}% ${slope.y > 0 ? 'lighter at the bottom' : 'lighter at the top'}`,
+      slope.x !== 0 && `${pct(slope.x)}% ${slope.x > 0 ? 'lighter on the right' : 'lighter on the left'}`,
+    ].filter(Boolean);
+    field.notes.unshift(`Uneven light evened out: ${words.join(', ')}.`);
+  }
+  return { width: px.width, height: px.height, margin, bands, field };
 }
