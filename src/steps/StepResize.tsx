@@ -116,6 +116,7 @@ export function StepResize() {
         if (states.includes('hidden')) return [`${name} is left out: too little room.`];
         if (states.includes('cropped')) return [`${name} is cropped.`];
         if (states.includes('forced')) return [`${name} is stretched past its limits.`];
+        if (states.includes('crowded')) return [`${name} is at its smallest and runs into another motif.`];
         return [];
       })
     : [];

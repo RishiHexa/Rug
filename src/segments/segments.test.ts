@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { fitRun, layoutRug, type DrawOp } from './layout';
 import { makeRule, minimumSize, newSegment, type Art, type Segment, type SegmentDoc } from './model';
-import { findBands, findRepeat, flatColor, type Pixels } from './split';
+import { findBandEdges, findPeriod, isPlain } from './analyse';
+import type { Pixels } from './pixels';
 
 const art = { canvas: {} as HTMLCanvasElement, crisp: false } satisfies Art;
 const ends = (r: { pieces: { start: number; length: number }[] }) =>
@@ -206,25 +207,25 @@ describe('reading a rug picture', () => {
       const d = Math.min(x, y, 299 - x, 399 - y);
       return d < 10 ? [120, 10, 20] : d < 24 ? [220, 190, 130] : d < 60 ? [15, 12, 14] : [110, 12, 22];
     });
-    expect(findBands(px)).toEqual([10, 24, 60]);
+    expect(findBandEdges(px).map((e) => e.top)).toEqual([10, 24, 60]);
   });
   it('finds nothing in a plain picture', () => {
-    expect(findBands(picture(200, 200, () => [90, 40, 40]))).toEqual([]);
+    expect(findBandEdges(picture(200, 200, () => [90, 40, 40]))).toEqual([]);
   });
-  it('recognises flat color', () => {
-    expect(flatColor(picture(20, 20, () => [90, 40, 40]))).not.toBeNull();
-    expect(flatColor(picture(20, 20, (x) => (x % 4 < 2 ? [20, 20, 20] : [230, 230, 230])))).toBeNull();
+  it('recognises a plain band', () => {
+    expect(isPlain(picture(40, 20, () => [90, 40, 40]))).toBe(true);
+    expect(isPlain(picture(40, 20, (x) => (x % 8 < 4 ? [20, 20, 20] : [230, 230, 230])))).toBe(false);
   });
   it('finds the length of a repeat', () => {
     const px = picture(240, 20, (x, y) => {
       const u = x % 34;
       return (u - 17) ** 2 + (y - 10) ** 2 < 60 ? [230, 200, 150] : u < 5 ? [150, 60, 40] : [20, 16, 18];
     });
-    expect(findRepeat(px, 10)).toBe(34);
+    expect(findPeriod(px, 10, 120)?.unit).toBe(34);
   });
   it('finds no repeat where there is none', () => {
     let seed = 3;
     const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
-    expect(findRepeat(picture(240, 20, () => [random() * 255, random() * 255, random() * 255]), 10)).toBeNull();
+    expect(findPeriod(picture(240, 20, () => [random() * 255, random() * 255, random() * 255]), 10, 120)).toBeNull();
   });
 });

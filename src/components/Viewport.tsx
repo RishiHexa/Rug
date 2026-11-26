@@ -6,6 +6,7 @@ import {
   useState,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
+  type RefObject,
 } from 'react';
 import { keepFocus } from './ui';
 
@@ -33,6 +34,13 @@ export interface WorldRect {
   height: number;
 }
 
+export interface Padding {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
 export interface ToolHandlers {
   onDown(world: Point): void;
   onMove(world: Point[]): void;
@@ -43,7 +51,7 @@ interface Props {
   /** The area "Fit" shows, in world units. */
   bounds: WorldRect;
   /** Space reserved around the fitted area, e.g. for rulers. */
-  padding: { left: number; top: number; right: number; bottom: number };
+  padding: Padding;
   maxScale: number;
   label: string;
   cursor?: string;
@@ -57,42 +65,33 @@ interface Props {
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-/**
- * Zoomable, pannable canvas. Wheel or pinch zooms, drag (or Space + drag, or
- * the middle button) pans, and the keyboard works when the canvas has focus.
- */
-export function Viewport({
-  bounds,
-  padding,
-  maxScale,
-  label,
-  cursor = 'grab',
-  draw,
-  tool,
-  onHover,
-  children,
-}: Props) {
-  const boxRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+/** Tracks the size of an element. */
+export function useBoxSize(ref: RefObject<HTMLElement | null>): Size | null {
   const [size, setSize] = useState<Size | null>(null);
-  /** null = fitted, and stays fitted while the window resizes. */
-  const [custom, setCustom] = useState<View | null>(null);
-  const [spaceHeld, setSpaceHeld] = useState(false);
-  const [panning, setPanning] = useState(false);
-
-  const pointers = useRef(new Map<number, Point>());
-  const gesture = useRef<'none' | 'tool' | 'pan' | 'pinch'>('none');
-
   useLayoutEffect(() => {
-    const box = boxRef.current!;
+    const box = ref.current!;
     const measure = () => setSize({ width: box.clientWidth, height: box.clientHeight });
     measure();
     const observer = new ResizeObserver(measure);
     observer.observe(box);
     return () => observer.disconnect();
-  }, []);
+  }, [ref]);
+  return size;
+}
 
-  const fit = size && fitView(bounds, padding, size);
+/**
+ * Zoom and pan state over a fitted view. The view stays fitted (and follows
+ * the window and `fit`) until the person zooms or pans; "Fit" goes back.
+ * Wheel and trackpad pinch on `boxRef` zoom at the pointer.
+ */
+export function useZoomPan(
+  boxRef: RefObject<HTMLElement | null>,
+  fit: View | null,
+  size: Size | null,
+  maxScale: number,
+) {
+  /** null = fitted. */
+  const [custom, setCustom] = useState<View | null>(null);
   const view = custom ?? fit;
   const minScale = fit ? fit.scale * 0.5 : 0;
   const topScale = Math.max(maxScale, fit ? fit.scale * 4 : 0);
@@ -101,7 +100,7 @@ export function Viewport({
   const viewRef = useRef(view);
   viewRef.current = view;
 
-  const apply = useCallback((next: View) => {
+  const setView = useCallback((next: View | null) => {
     viewRef.current = next;
     setCustom(next);
   }, []);
@@ -112,17 +111,17 @@ export function Viewport({
       if (!v) return;
       const scale = clamp(v.scale * factor, minScale, topScale);
       const k = scale / v.scale;
-      apply({ scale, x: at.x - (at.x - v.x) * k, y: at.y - (at.y - v.y) * k });
+      setView({ scale, x: at.x - (at.x - v.x) * k, y: at.y - (at.y - v.y) * k });
     },
-    [apply, minScale, topScale],
+    [setView, minScale, topScale],
   );
 
   const panBy = useCallback(
     (dx: number, dy: number) => {
       const v = viewRef.current;
-      if (v) apply({ ...v, x: v.x + dx, y: v.y + dy });
+      if (v) setView({ ...v, x: v.x + dx, y: v.y + dy });
     },
-    [apply],
+    [setView],
   );
 
   const zoomCentre = (factor: number) => {
@@ -142,7 +141,104 @@ export function Viewport({
     };
     box.addEventListener('wheel', onWheel, { passive: false });
     return () => box.removeEventListener('wheel', onWheel);
-  }, [zoomAt]);
+  }, [boxRef, zoomAt]);
+
+  /** Arrow keys pan, plus and minus zoom, 0 fits. */
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    const step = 60;
+    const actions: Record<string, () => void> = {
+      ArrowLeft: () => panBy(step, 0),
+      ArrowRight: () => panBy(-step, 0),
+      ArrowUp: () => panBy(0, step),
+      ArrowDown: () => panBy(0, -step),
+      '+': () => zoomCentre(1.4),
+      '=': () => zoomCentre(1.4),
+      '-': () => zoomCentre(1 / 1.4),
+      '0': toFit,
+    };
+    const action = actions[e.key];
+    if (!action || e.ctrlKey || e.metaKey) return;
+    e.preventDefault();
+    action();
+  };
+
+  return { view, viewRef, zoomed: custom !== null, setView, zoomAt, panBy, zoomCentre, toFit, onKeyDown };
+}
+
+type ZoomPan = ReturnType<typeof useZoomPan>;
+
+/**
+ * Pointer handlers for a surface with no tool of its own: drag pans and two
+ * fingers pinch.
+ */
+export function usePanGesture(zp: ZoomPan) {
+  const pointers = useRef(new Map<number, Point>());
+  const [panning, setPanning] = useState(false);
+
+  const local = (e: ReactPointerEvent): Point => {
+    const r = e.currentTarget.getBoundingClientRect();
+    return { x: e.clientX - r.left, y: e.clientY - r.top };
+  };
+
+  const onPointerDown = (e: ReactPointerEvent) => {
+    if (e.button > 1) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    pointers.current.set(e.pointerId, local(e));
+    setPanning(true);
+  };
+  const onPointerMove = (e: ReactPointerEvent) => {
+    const last = pointers.current.get(e.pointerId);
+    if (!last) return;
+    const p = local(e);
+    const other = [...pointers.current].find(([id]) => id !== e.pointerId)?.[1];
+    if (other) {
+      const before = Math.hypot(last.x - other.x, last.y - other.y);
+      const after = Math.hypot(p.x - other.x, p.y - other.y);
+      zp.panBy((p.x - last.x) / 2, (p.y - last.y) / 2);
+      if (before > 0) zp.zoomAt(after / before, { x: (p.x + other.x) / 2, y: (p.y + other.y) / 2 });
+    } else {
+      zp.panBy(p.x - last.x, p.y - last.y);
+    }
+    pointers.current.set(e.pointerId, p);
+  };
+  const onPointerEnd = (e: ReactPointerEvent) => {
+    pointers.current.delete(e.pointerId);
+    if (pointers.current.size === 0) setPanning(false);
+  };
+
+  return {
+    panning,
+    handlers: { onPointerDown, onPointerMove, onPointerUp: onPointerEnd, onPointerCancel: onPointerEnd },
+  };
+}
+
+/**
+ * Zoomable, pannable canvas. Wheel or pinch zooms, drag (or Space + drag, or
+ * the middle button) pans, and the keyboard works when the canvas has focus.
+ */
+export function Viewport({
+  bounds,
+  padding,
+  maxScale,
+  label,
+  cursor = 'grab',
+  draw,
+  tool,
+  onHover,
+  children,
+}: Props) {
+  const boxRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const size = useBoxSize(boxRef);
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const [panning, setPanning] = useState(false);
+
+  const pointers = useRef(new Map<number, Point>());
+  const gesture = useRef<'none' | 'tool' | 'pan' | 'pinch'>('none');
+
+  const fit = size && fitView(bounds, padding, size);
+  const zp = useZoomPan(boxRef, fit, size, maxScale);
+  const { view, viewRef, zoomAt, panBy } = zp;
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -168,14 +264,7 @@ export function Viewport({
   useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !size || !view) return;
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.max(1, Math.round(size.width * dpr));
-    const h = Math.max(1, Math.round(size.height * dpr));
-    if (canvas.width !== w) canvas.width = w;
-    if (canvas.height !== h) canvas.height = h;
-    const ctx = canvas.getContext('2d')!;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, size.width, size.height);
+    const ctx = prepareCanvas(canvas, size);
     draw(ctx, view, size);
   });
 
@@ -236,24 +325,6 @@ export function Viewport({
     setPanning(false);
   };
 
-  const onKeyDown = (e: React.KeyboardEvent) => {
-    const step = 60;
-    const actions: Record<string, () => void> = {
-      ArrowLeft: () => panBy(step, 0),
-      ArrowRight: () => panBy(-step, 0),
-      ArrowUp: () => panBy(0, step),
-      ArrowDown: () => panBy(0, -step),
-      '+': () => zoomCentre(1.4),
-      '=': () => zoomCentre(1.4),
-      '-': () => zoomCentre(1 / 1.4),
-      '0': toFit,
-    };
-    const action = actions[e.key];
-    if (!action || e.ctrlKey || e.metaKey) return;
-    e.preventDefault();
-    action();
-  };
-
   return (
     <div ref={boxRef} className="absolute inset-0 overflow-hidden">
       <canvas
@@ -268,14 +339,34 @@ export function Viewport({
         onPointerUp={onPointerEnd}
         onPointerCancel={onPointerEnd}
         onPointerLeave={() => onHover?.(null)}
-        onKeyDown={onKeyDown}
+        onKeyDown={zp.onKeyDown}
       />
       {children}
-      <div className="absolute right-4 bottom-4 flex overflow-hidden rounded-md border border-line-strong bg-panel">
-        <ZoomButton label="Zoom out" text="−" onClick={() => zoomCentre(1 / 1.4)} />
-        <ZoomButton label="Zoom in" text="+" onClick={() => zoomCentre(1.4)} />
-        <ZoomButton label="Fit to view" text="Fit" onClick={toFit} />
-      </div>
+      <ZoomControls zoomPan={zp} />
+    </div>
+  );
+}
+
+/** Sizes the canvas to the box at device resolution and clears it. */
+export function prepareCanvas(canvas: HTMLCanvasElement, size: Size): CanvasRenderingContext2D {
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.max(1, Math.round(size.width * dpr));
+  const h = Math.max(1, Math.round(size.height * dpr));
+  if (canvas.width !== w) canvas.width = w;
+  if (canvas.height !== h) canvas.height = h;
+  const ctx = canvas.getContext('2d')!;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, size.width, size.height);
+  return ctx;
+}
+
+/** Zoom out, zoom in and fit, in the bottom-right corner of the stage. */
+export function ZoomControls({ zoomPan }: { zoomPan: ZoomPan }) {
+  return (
+    <div className="absolute right-4 bottom-4 flex overflow-hidden rounded-md border border-line-strong bg-panel">
+      <ZoomButton label="Zoom out" text="−" onClick={() => zoomPan.zoomCentre(1 / 1.4)} />
+      <ZoomButton label="Zoom in" text="+" onClick={() => zoomPan.zoomCentre(1.4)} />
+      <ZoomButton label="Fit to view" text="Fit" onClick={zoomPan.toFit} />
     </div>
   );
 }
@@ -294,7 +385,7 @@ function ZoomButton({ label, text, onClick }: { label: string; text: string; onC
   );
 }
 
-function fitView(bounds: WorldRect, padding: Props['padding'], size: Size): View {
+export function fitView(bounds: WorldRect, padding: Padding, size: Size): View {
   const w = Math.max(1, size.width - padding.left - padding.right);
   const h = Math.max(1, size.height - padding.top - padding.bottom);
   const scale = Math.min(w / bounds.width, h / bounds.height);

@@ -1,10 +1,12 @@
 /** Paints a segment design, and prepares the artwork it uses. */
 import { assignNearest, type Palette } from '../domain/clustering';
-import { hexToOklab, hexToRgb, linearToOklab, SRGB_TO_LINEAR } from '../domain/color';
+import { hexToOklab, hexToRgb, linearToOklab, oklabToHex, SRGB_TO_LINEAR } from '../domain/color';
+import { dominantColor } from './analyse';
+import { shapeMask } from './cutout';
 import type { GridSpec } from '../domain/dimensions';
 import type { DesignSource } from '../domain/pipeline';
-import { layoutRug, type RugLayout } from './layout';
-import type { Art, SegmentDoc } from './model';
+import { layoutRug, type ArtKind, type RugLayout } from './layout';
+import { ART_SLOTS, type Art, type ArtSlot, type SegmentDoc } from './model';
 
 const MAX_ART_SIDE = 2000;
 const MAX_OUTPUT_SIDE = 8192;
@@ -15,6 +17,15 @@ export function makeCanvas(width: number, height: number): HTMLCanvasElement {
   canvas.height = Math.max(1, Math.round(height));
   return canvas;
 }
+
+/** The segment field each kind of drawing operation takes its picture from. */
+const ART_OF: Record<ArtKind, ArtSlot> = {
+  main: 'art',
+  corner: 'cornerArt',
+  side: 'sideArt',
+  center: 'centerArt',
+  sideCenter: 'sideCenterArt',
+};
 
 /** Paints a layout; `scaleX/Y` are pixels per inch. */
 export function paintLayout(
@@ -30,7 +41,7 @@ export function paintLayout(
   ctx.transform(scaleX, 0, 0, scaleY, x, y);
   for (const op of layout.ops) {
     const segment = doc.segments[op.segment];
-    const art = op.art === 'corner' ? segment?.cornerArt : op.art === 'main' ? segment?.art : null;
+    const art = op.art && segment ? segment[ART_OF[op.art]] : null;
     if (op.art && !art) continue;
     ctx.save();
     ctx.transform(...op.matrix);
@@ -49,7 +60,13 @@ export function paintLayout(
       ctx.imageSmoothingQuality = 'high';
       ctx.translate(box.x + box.width / 2, box.y + box.height / 2);
       ctx.scale(op.flipX ? -1 : 1, op.flipY ? -1 : 1);
-      ctx.drawImage(art.canvas, -box.width / 2, -box.height / 2, box.width, box.height);
+      if (op.slot) {
+        const { width, height } = art.canvas;
+        const sw = width / op.slot.of;
+        ctx.drawImage(art.canvas, sw * op.slot.index, 0, sw, height, -box.width / 2, -box.height / 2, box.width, box.height);
+      } else {
+        ctx.drawImage(art.canvas, -box.width / 2, -box.height / 2, box.width, box.height);
+      }
     }
     ctx.restore();
   }
@@ -62,7 +79,7 @@ export function paintLayout(
  */
 export function renderSegments(doc: SegmentDoc, grid: GridSpec): HTMLCanvasElement {
   const { columns, rows, widthIn, heightIn } = grid;
-  const arts = doc.segments.flatMap((s) => [s.art, s.cornerArt]);
+  const arts = doc.segments.flatMap((s) => ART_SLOTS.map((slot) => s[slot]));
   const soft = arts.some((a) => a && !a.crisp);
   const perKnot = soft && Math.max(columns, rows) * 2 <= MAX_OUTPUT_SIDE ? 2 : 1;
   const canvas = makeCanvas(columns * perKnot, rows * perKnot);
@@ -109,6 +126,41 @@ export function clearColor(art: Art, hex: string, tolerance: number): Art {
       data[p + 3] = 0;
     }
   }
+  ctx.putImageData(image, 0, 0);
+  return { ...art, canvas };
+}
+
+/** Most common color round the edge of a picture: its background. */
+export function edgeColor(canvas: HTMLCanvasElement): string {
+  const { width, height } = canvas;
+  const all = canvas.getContext('2d', { willReadFrequently: true })!.getImageData(0, 0, width, height);
+  const ring: number[] = [];
+  for (let x = 0; x < width; x++) ring.push(x, (height - 1) * width + x);
+  for (let y = 1; y < height - 1; y++) ring.push(y * width, y * width + width - 1);
+  const data = new Uint8ClampedArray(ring.length * 4);
+  ring.forEach((i, n) => data.set(all.data.subarray(i * 4, i * 4 + 4), n * 4));
+  return oklabToHex(dominantColor({ data, width: ring.length, height: 1 }));
+}
+
+/**
+ * Only the shape: the background color is removed where it reaches the
+ * picture's edges, so the same color inside the shape stays. `keep` center
+ * drops bits of neighbouring motifs cut by the edges.
+ */
+export function keepShape(art: Art, hex: string, tolerance: number, keep: 'center' | 'all'): Art {
+  const { width, height } = art.canvas;
+  const canvas = makeCanvas(width, height);
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!;
+  ctx.drawImage(art.canvas, 0, 0);
+  const image = ctx.getImageData(0, 0, width, height);
+  const mask = shapeMask(image, {
+    background: [hexToOklab(hex)],
+    tolerance,
+    reach: 'edge',
+    keep,
+    smooth: Math.max(1, Math.round(Math.min(width, height) / 220)),
+  });
+  for (let i = 0; i < mask.data.length; i++) if (mask.data[i] === 0) image.data[i * 4 + 3] = 0;
   ctx.putImageData(image, 0, 0);
   return { ...art, canvas };
 }
@@ -169,8 +221,7 @@ export function recolorDoc(doc: SegmentDoc, detected: Palette[], current: Palett
     segments: doc.segments.map((s) => ({
       ...s,
       color: s.color && recolorHex(s.color),
-      art: art(s.art),
-      cornerArt: art(s.cornerArt),
+      ...Object.fromEntries(ART_SLOTS.map((slot) => [slot, art(s[slot])])),
     })),
   };
 }

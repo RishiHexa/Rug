@@ -131,6 +131,37 @@ export function LimitField({
   );
 }
 
+/** A whole number within limits. */
+export function CountField({
+  label,
+  value,
+  min,
+  max,
+  suffix = '',
+  onChange,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  suffix?: string;
+  onChange(value: number): void;
+}) {
+  return (
+    <NumberField
+      label={label}
+      suffix={suffix}
+      text={String(value)}
+      onText={(text) => {
+        const v = parse(text);
+        if (!Number.isInteger(v) || v < min || v > max) return false;
+        onChange(v);
+        return true;
+      }}
+    />
+  );
+}
+
 export function PercentField({
   label,
   value,

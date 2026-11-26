@@ -5,7 +5,7 @@ import type { Crop } from '../design/upload';
 import type { ClusterSettings } from '../domain/clustering';
 import { gridSpecOf, type DimensionValues, type GridSpec, type Unit } from '../domain/dimensions';
 import { makeCanvas } from '../segments/compose';
-import type { Art, Segment, SegmentDoc } from '../segments/model';
+import { ART_SLOTS, upgradeSegment, type Art, type ArtSlot, type Segment, type SegmentDoc } from '../segments/model';
 import { useApp, type AppData, type DesignDraft, type DesignKind, type KnotMap } from './store';
 
 export interface ProjectInfo {
@@ -22,7 +22,7 @@ interface SavedArt {
   png: Blob;
   crisp: boolean;
 }
-type SavedSegment = Omit<Segment, 'art' | 'cornerArt'> & { art: SavedArt | null; cornerArt: SavedArt | null };
+type SavedSegment = Omit<Segment, ArtSlot> & Partial<Record<ArtSlot, SavedArt | null>>;
 type SavedDoc = Omit<SegmentDoc, 'segments'> & { segments: SavedSegment[] };
 
 interface SavedProject {
@@ -116,13 +116,20 @@ const loadArt = async (art: SavedArt | null): Promise<Art | null> =>
 
 async function saveDoc(doc: SegmentDoc): Promise<SavedDoc> {
   const segments = await Promise.all(
-    doc.segments.map(async (s) => ({ ...s, art: await saveArt(s.art), cornerArt: await saveArt(s.cornerArt) })),
+    doc.segments.map(async (s) => {
+      const arts = await Promise.all(ART_SLOTS.map(async (slot) => [slot, await saveArt(s[slot])] as const));
+      return { ...s, ...Object.fromEntries(arts) } as SavedSegment;
+    }),
   );
   return { ...doc, segments };
 }
 async function loadDoc(doc: SavedDoc): Promise<SegmentDoc> {
   const segments = await Promise.all(
-    doc.segments.map(async (s) => ({ ...s, art: await loadArt(s.art), cornerArt: await loadArt(s.cornerArt) })),
+    doc.segments.map(async (s) => {
+      const arts = await Promise.all(ART_SLOTS.map(async (slot) => [slot, await loadArt(s[slot] ?? null)] as const));
+      // Designs saved before layers had roles and side artwork get the defaults.
+      return upgradeSegment({ ...s, ...Object.fromEntries(arts) } as Segment);
+    }),
   );
   return { ...doc, segments };
 }

@@ -83,10 +83,54 @@ Added on request; the original spec excluded saving and pattern rules.
 
 - Order of preference: pieces stay at 100% while gaps grow up to their limit; then the count changes, choosing whichever number squeezes or stretches the pieces least; only then is the segment cropped or stretched past its limits.
 - Mirrored pieces are added in pairs. When they are cropped, a whole pair stays in the middle.
-- Border inset and thickness do not change with the rug.
-- Motifs grow in proportion to the room they are in, within their limits.
+- Border inset and thickness do not change with the rug, unless the design says borders follow the rug (see below).
+- Motifs grow in proportion to the room they are in, within their limits. A motif that follows another takes that one's size instead. Offsets are at 100% and grow with the motif.
 - In the knot map, pieces start and end on whole knots.
-- "Split a rug picture" finds bands where the average color changes with distance from the edge, and the length of a repeat by comparing each band with itself shifted. Bands that do not clearly repeat become a mirrored half side. All four sides use the top side's artwork, and all four corners the top-left one's.
+
+### Reading a rug picture
+
+Replaces "Split a rug picture", which only cut the picture into rectangles. "Read a rug picture" finds the parts of the rug, numbered as on a rug component map, and makes each one a layer: its background color, its shapes cut free of that background, and resize rules.
+
+| # | Part | How it is found | Layer and rules |
+|---|---|---|---|
+| 1 | End finish | Always there | Not a layer; the rug preview draws the fringe |
+| 2 | Outer edge band | Outermost band that is one plain color | Border, color only |
+| 3, 4 | Outer guards | Thin patterned bands outside the main border | Border; one unit slid round, no mirroring, mitred corners |
+| 5 | Main border | Widest patterned band, at least 1.8 × the others | Border laid out from the middle (see below), own artwork for the sides |
+| 6 | Border corners | Corner square of the main border | Corner piece; keeps the border's size, never stretched |
+| 7, 8 | Inner guards | Thin patterned bands inside the main border | As outer guards |
+| 9 | Field (ground) | What fills the middle of the long sides of the field | Fill: a quarter, mirrored both ways, with its small motifs; the big shapes are cut out of it |
+| 10 | Central medallion | Big non-ground shape at the center, holes filled | Motif at the center, keeps its shape |
+| 11 | Pendants | Big shapes on the vertical middle line above and below it | Motif hung above and below the medallion |
+| 12 | Corner spandrels | A color much denser in the four field corners than elsewhere, and all the field the center cannot reach without crossing it | Motif in the four corners, mirrored |
+| 13 | Spandrel pockets | A box-like patch of another color in a spandrel's outer corner | Motif that follows the spandrel |
+
+- **Only the shape.** A rectangle round a motif carries ground color and bits of its neighbours. The ground is removed only where it reaches the rectangle's edges, so the same color inside the shape stays; then only the part in the middle is kept (or the part the analysis found there). The field layer is the exception: its ground is removed everywhere, because the layer's own color is that ground.
+- **Ground colors** are the largest group of near-identical colors in a part, clustered without blurring so motifs do not muddy it. Lightness counts half in every color comparison: abrash, the natural variation of hand-dyed wool, mostly changes lightness.
+- **Band edges** are found on each side separately, then lined up with the top side by a scale and a shift, because a photo is rarely square-on (here the bottom border looked 1.25 × the top). Each edge is then settled on its own side. Edges where the ground is the same either side are dropped (a row of motifs, not a new band). A thin innermost band that does not repeat is taken for the edge of the field. A neutral margin at the picture's edge (floor, backdrop, shadow) is left out, side by side.
+- **Plain or patterned.** A band is plain when 88% of its middle is within 0.05 of its main color: hand-dyed streaks stay inside that, motifs do not.
+- **Repeats.** Hand-knotted motifs are never drawn the same twice, so a band matches itself one unit on by only 0.25 to 0.5 (a printed design would reach 0.9). The repeat search uses color as well as lightness and accepts a clear peak from 0.22.
+- **Main borders mirror; they do not repeat.** The top run here is M1 M3 M2 M4 | M9 | M4 M2 M3 M1, all different. It is cut into slots: a middle piece and the same number of slots either side. The slot count is the one, of those near "slots about as long as the band is thick", whose slot edges fall most on the border's ground, between motifs. Growing adds one slot each side and continues the order outwards (M4 M2 M3 M1 M4 …), so anchors and crosses keep alternating.
+- **Quartered field.** Taken as quartered when it is like its own mirror image both ways by 0.3 or more, measured after blurring (a photo at a slight angle is never an exact mirror).
+- The picture is read at up to 1800 px on its long side; thin guards are only a few pixels wide at 900 px. Reading the example rug takes about 2.5 s; a progress line shows meanwhile.
+- Any part can be left out before the layers are made. Moving a band edge reads the picture again with that edge.
+- Anything found can be replaced afterwards with "Picture", which now offers "Only the shape, off its background" (the default), "Remove one color everywhere" (the old behaviour) or "The whole rectangle".
+
+### The assumptions, checked against the example rug
+
+- **Medallion only scales and stays at the center: confirmed.** It grows with the field's tighter side, keeping its shape, so a longer rug gets more ground above and below, not a taller medallion.
+- **Pendants scale and keep padding from the border or the medallion: half right.** In this rug the pendants hang from the medallion's tips by a stem; they are not spaced from the border. So they take the medallion's size and keep their gap to it (scaled), and only the border sets a limit: at least half the room they had. Without that room they shrink, and below their smallest size they are left out rather than squeezed.
+- **Spandrels** were not in the list but needed a rule: anchored in the field's corners and scaled exactly like the medallion. Then the octagon keeps its angles at every size and never closes onto the medallion. Pockets take the spandrel's size and stay in its corner.
+- **Border corners do not stretch: confirmed**, and the main border re-pitches its slots between them.
+- **Guards slide without mirroring: confirmed.** Their unit is about 24 px on the 1393 px example, as the repeat map says.
+- **Not assumed, but needed: borders shrink on small rugs.** With fixed borders a 3 × 10 ft runner from a 9 × 12 ft design was almost all border. Read designs therefore let borders follow the rug's shorter side, from 55% to 120%, all by the same amount so they stay flush, and their motifs with them. This can be turned off or changed in the builder.
+- **Small rugs** carry proportionally smaller medallions and spandrels, so read motifs may shrink to 30%. When motifs that are not tied to each other still run into each other at their limits (much more than at the original size), both are marked "crowded" and a warning shows.
+
+### Rug size while building
+
+- Dragging the rug's handles, or typing a width or length, in the segment builder now sets the rug's size. Step 1 shows it, with the knot grid worked out again. The design was "tested" before and the size stayed the same.
+- The knot limits (16,384 per side, 25 million in all) and the borders' smallest size apply while dragging.
+- Upload and drawing work in progress is fitted to the new proportions, as after resizing.
 
 ### Resizing
 
@@ -110,6 +154,8 @@ Added on request after the first build; the original spec excluded exports. File
 - No PDF or spreadsheet library is used; both writers are small and tested by decoding their output.
 
 ## Running
+
+- `dev/analyse.dev.test.ts` runs the picture reading on a real photo and writes what it found, for tuning. It is skipped unless `RUG_FIXTURE` names a raw RGBA file (4-byte width, 4-byte height, then pixels) and `RUG_OUT` a folder.
 
 - `npm install`, then `npm run dev`. `npm test` runs the unit tests.
 - On Windows, if Vitest fails with "Cannot read properties of undefined (reading 'config')", the shell is using a lowercase drive letter (`c:`), which loads Vitest twice. Run it from a path that starts with `C:`.

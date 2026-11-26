@@ -1,5 +1,6 @@
 import {
   CheckField,
+  CountField,
   formatShort,
   LengthField,
   LimitField,
@@ -10,16 +11,15 @@ import {
 import { Button } from '../components/ui';
 import type { Unit } from '../domain/dimensions';
 import type { Run, SegmentReport } from '../segments/layout';
-import type { AxisRule, Placement, Segment } from '../segments/model';
+import type { ArtSlot, AxisRule, Placement, Segment, SegmentDoc } from '../segments/model';
 import { ArtThumb } from './PictureTools';
-
-export type ArtSlot = 'art' | 'cornerArt';
 
 /** Everything about one segment: color, artwork, place and rules. */
 export function SegmentForm({
   segment,
   report,
   unit,
+  doc,
   onChange,
   onDraw,
   onPicture,
@@ -27,6 +27,8 @@ export function SegmentForm({
   segment: Segment;
   report: SegmentReport | undefined;
   unit: Unit;
+  /** The whole design, for choosing a motif to follow. */
+  doc: SegmentDoc;
   onChange(patch: Partial<Segment>): void;
   onDraw(slot: ArtSlot): void;
   onPicture(slot: ArtSlot): void;
@@ -91,7 +93,10 @@ export function SegmentForm({
           <span className="text-sm text-muted">See-through</span>
         )}
       </div>
-      {artRow('art', 'Artwork')}
+      {artRow('art', p.type === 'border' ? 'Artwork along the ends' : 'Artwork')}
+      {p.type === 'border' && segment.x.symmetric && artRow('centerArt', 'Middle piece of the ends')}
+      {p.type === 'border' && artRow('sideArt', 'Own artwork for the sides (optional)')}
+      {p.type === 'border' && segment.sideArt && segment.y.symmetric && artRow('sideCenterArt', 'Middle piece of the sides')}
 
       <Section title="Place">
         {p.type === 'border' && (
@@ -153,13 +158,44 @@ export function SegmentForm({
                 ['center', 'Center'],
                 ['corners', 'All four corners, mirrored'],
                 ['edges', 'Top and bottom, mirrored'],
+                ['axis', 'Above and below the motif it follows'],
               ]}
               onChange={(anchor) => place({ anchor })}
             />
+            <SelectField
+              label="Size from"
+              value={p.follow ?? ''}
+              options={[
+                ['', 'Its own room'],
+                ...doc.segments
+                  .filter((o) => o.id !== segment.id && o.placement.type === 'motif')
+                  .map((o): [string, string] => [o.id, o.name]),
+              ]}
+              onChange={(follow) => place({ follow: follow || null })}
+            />
             <Row>
               <LengthField label="Offset across" value={p.offsetX} unit={unit} min={-1000} onChange={(offsetX) => place({ offsetX })} />
-              <LengthField label="Offset down" value={p.offsetY} unit={unit} min={-1000} onChange={(offsetY) => place({ offsetY })} />
+              <LengthField
+                label={p.anchor === 'axis' && p.follow ? 'Gap to it' : 'Offset down'}
+                value={p.offsetY}
+                unit={unit}
+                min={-1000}
+                onChange={(offsetY) => place({ offsetY })}
+              />
             </Row>
+            {p.anchor === 'axis' && (
+              <LengthField
+                label="Least room to the border"
+                value={p.edgeGap}
+                unit={unit}
+                onChange={(edgeGap) => place({ edgeGap })}
+              />
+            )}
+            <p className="text-sm text-muted">
+              Offsets are at 100% size and grow with the motif.
+              {p.follow ? ' It takes its size from the motif it follows.' : ''}
+              {p.anchor === 'axis' ? ' Without room for it, it shrinks, then is left out.' : ''}
+            </p>
             <Row>
               <LengthField label="Width" value={segment.x.piece} unit={unit} min={0.1} onChange={(piece) => rule('x')({ piece })} />
               <LengthField label="Height" value={segment.y.piece} unit={unit} min={0.1} onChange={(piece) => rule('y')({ piece })} />
@@ -170,7 +206,16 @@ export function SegmentForm({
       </Section>
 
       {p.type === 'border' && (
-        <RuleSection title="Along the border" rule={segment.x} run={report?.x ?? report?.y} unit={unit} onChange={rule('x')} />
+        <RuleSection
+          title={segment.sideArt ? 'Along the ends' : 'Along the border'}
+          rule={segment.x}
+          run={report?.x ?? report?.y}
+          unit={unit}
+          onChange={rule('x')}
+        />
+      )}
+      {p.type === 'border' && segment.sideArt && (
+        <RuleSection title="Along the sides" rule={segment.y} run={report?.y} unit={unit} onChange={rule('y')} />
       )}
       {p.type === 'fill' && (
         <>
@@ -265,7 +310,23 @@ function RuleSection({ title, rule, run, unit, onChange }: RuleProps) {
               onChange={(maxGap) => onChange({ maxGap })}
             />
           </Row>
-          <CheckField label="Mirror every other piece" checked={rule.flip} onChange={(flip) => onChange({ flip })} />
+          <CheckField
+            label="Lay out from the middle, the far half mirrored"
+            checked={rule.symmetric}
+            onChange={(symmetric) => onChange({ symmetric, flip: symmetric ? false : rule.flip })}
+          />
+          {rule.symmetric ? (
+            <LengthField label="Middle piece" value={rule.center} unit={unit} onChange={(center) => onChange({ center })} />
+          ) : (
+            <CheckField label="Mirror every other piece" checked={rule.flip} onChange={(flip) => onChange({ flip })} />
+          )}
+          <CountField
+            label="Different pieces in the artwork, used in turn"
+            value={rule.slots}
+            min={1}
+            max={24}
+            onChange={(slots) => onChange({ slots })}
+          />
         </>
       )}
       <Row>
@@ -305,8 +366,9 @@ function RunNote({ run, unit }: { run: Run | null | undefined; unit: Unit }) {
     cropped: ', cropped at the edges',
     forced: ', past its limits',
     hidden: '',
+    crowded: ', at its limit and running into another motif',
   }[run.state];
-  const warn = run.state === 'forced' || run.state === 'cropped' || run.state === 'hidden';
+  const warn = run.state !== 'fits' && run.state !== 'room';
   return (
     <p className={`text-sm ${warn ? 'text-warn' : 'text-muted'}`}>
       {run.state === 'hidden' ? 'At this size: left out, too little room.' : `At this size: ${parts.join(', ')}${note}.`}

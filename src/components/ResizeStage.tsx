@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState, type PointerEvent } from 'react';
 import { CM_PER_IN, formatLength, type Unit } from '../domain/dimensions';
+import { prepareCanvas, useBoxSize, usePanGesture, useZoomPan, ZoomControls } from './Viewport';
 
 export interface RugSize {
   width: number;
@@ -45,64 +46,56 @@ const CURSORS: Record<string, string> = {
 /** Share of the stage the rug takes, leaving room to drag it bigger. */
 const FILL = 0.74;
 
-/** A rug that is resized by dragging its edges and corners. */
+/**
+ * A rug that is resized by dragging its edges and corners. Wheel, pinch and
+ * the zoom buttons zoom; dragging the background pans.
+ */
 export function ResizeStage({
   size,
   unit,
   keepShape = false,
+  maxScale = 200,
   limit,
   onResize,
+  onResizeEnd,
   paint,
 }: {
   size: RugSize;
   unit: Unit;
   keepShape?: boolean;
+  /** Most pixels per inch when zoomed in. */
+  maxScale?: number;
   /** Brings a size within what is possible. */
   limit(size: RugSize): RugSize;
   onResize(size: RugSize): void;
+  /** A drag, or a key press, has finished at this size. */
+  onResizeEnd?(size: RugSize): void;
   /** Draws the rug with its corner at `x`, `y`, at `scale` pixels per inch. */
   paint(ctx: CanvasRenderingContext2D, x: number, y: number, scale: number, size: RugSize): void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [box, setBox] = useState<RugSize | null>(null);
+  const box = useBoxSize(boxRef);
   /** While dragging, the view stays put and the opposite side stays in place. */
   const [drag, setDrag] = useState<{ handle: Handle; from: RugSize; view: View; px: number; py: number } | null>(null);
-
-  useLayoutEffect(() => {
-    const el = boxRef.current!;
-    const measure = () => setBox({ width: el.clientWidth, height: el.clientHeight });
-    measure();
-    const observer = new ResizeObserver(measure);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
 
   const fitted = (b: RugSize): View => {
     const scale = Math.min((b.width * FILL) / size.width, (b.height * FILL) / size.height);
     return { scale, x: (b.width - size.width * scale) / 2, y: (b.height - size.height * scale) / 2 };
   };
-  const view: View | null = !box
-    ? null
-    : drag
-      ? {
-          scale: drag.view.scale,
-          x: drag.view.x + (drag.handle.dx < 0 ? (drag.from.width - size.width) * drag.view.scale : 0),
-          y: drag.view.y + (drag.handle.dy < 0 ? (drag.from.height - size.height) * drag.view.scale : 0),
-        }
-      : fitted(box);
+  const zp = useZoomPan(boxRef, box && fitted(box), box, maxScale);
+  const pan = usePanGesture(zp);
+  const dragView = (d: NonNullable<typeof drag>, now: RugSize): View => ({
+    scale: d.view.scale,
+    x: d.view.x + (d.handle.dx < 0 ? (d.from.width - now.width) * d.view.scale : 0),
+    y: d.view.y + (d.handle.dy < 0 ? (d.from.height - now.height) * d.view.scale : 0),
+  });
+  const view: View | null = drag ? dragView(drag, size) : zp.view;
 
   useLayoutEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || !box || !view) return;
-    const dpr = window.devicePixelRatio || 1;
-    const w = Math.max(1, Math.round(box.width * dpr));
-    const h = Math.max(1, Math.round(box.height * dpr));
-    if (canvas.width !== w) canvas.width = w;
-    if (canvas.height !== h) canvas.height = h;
-    const ctx = canvas.getContext('2d')!;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, box.width, box.height);
+    const ctx = prepareCanvas(canvas, box);
     ctx.save();
     paint(ctx, view.x, view.y, view.scale, size);
     ctx.restore();
@@ -136,9 +129,9 @@ export function ResizeStage({
   };
 
   const start = (handle: Handle) => (e: PointerEvent<HTMLButtonElement>) => {
-    if (e.button !== 0 || !box) return;
+    if (e.button !== 0 || !view) return;
     e.currentTarget.setPointerCapture(e.pointerId);
-    setDrag({ handle, from: size, view: fitted(box), px: e.clientX, py: e.clientY });
+    setDrag({ handle, from: size, view, px: e.clientX, py: e.clientY });
   };
   const move = (e: PointerEvent) => {
     if (!drag) return;
@@ -147,7 +140,13 @@ export function ResizeStage({
     const dh = ((e.clientY - drag.py) / v.scale) * handle.dy;
     onResize(resized(handle, from, dw, dh));
   };
-  const end = () => setDrag(null);
+  const end = () => {
+    if (!drag) return;
+    // A zoomed view keeps the rug where the drag left it; a fitted one refits.
+    if (zp.zoomed) zp.setView(dragView(drag, size));
+    onResizeEnd?.(size);
+    setDrag(null);
+  };
 
   const onKeyDown = (handle: Handle) => (e: React.KeyboardEvent) => {
     const by: Record<string, [number, number]> = {
@@ -161,12 +160,25 @@ export function ResizeStage({
     e.preventDefault();
     const dw = d[0] * handle.dx * step;
     const dh = d[1] * handle.dy * step;
-    if (dw !== 0 || dh !== 0) onResize(resized(handle, size, dw, dh));
+    if (dw !== 0 || dh !== 0) {
+      const next = resized(handle, size, dw, dh);
+      onResize(next);
+      onResizeEnd?.(next);
+    }
   };
 
   return (
     <div ref={boxRef} className="absolute inset-0 overflow-hidden">
-      <canvas ref={canvasRef} role="img" aria-label="Rug" className="block h-full w-full" />
+      <canvas
+        ref={canvasRef}
+        tabIndex={0}
+        role="img"
+        aria-label="Rug. Arrow keys pan, plus and minus zoom, 0 fits."
+        style={{ cursor: pan.panning ? 'grabbing' : 'grab' }}
+        className="block h-full w-full touch-none focus-visible:-outline-offset-2"
+        onKeyDown={zp.onKeyDown}
+        {...pan.handlers}
+      />
       {view && (
         <>
           <p
@@ -207,6 +219,7 @@ export function ResizeStage({
           ))}
         </>
       )}
+      <ZoomControls zoomPan={zp} />
     </div>
   );
 }

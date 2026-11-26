@@ -3,9 +3,8 @@ import { CheckField } from '../components/fields';
 import { Button, Group, Heading, Notice, PanelBody, PanelFooter, TwoZone } from '../components/ui';
 import { Viewport, type Point, type Size, type View } from '../components/Viewport';
 import { ACCEPTED_TYPES } from '../design/upload';
-import { clearColor, cutArt, pixelHex } from '../segments/compose';
-import { segmentsFromPicture, suggestBands } from '../segments/fromPicture';
-import type { Art, SegmentDoc } from '../segments/model';
+import { clearColor, cutArt, edgeColor, keepShape } from '../segments/compose';
+import type { Art } from '../segments/model';
 
 /** A picture to take segments from; shared, so many parts can come from one. */
 export interface Picture {
@@ -13,7 +12,7 @@ export interface Picture {
   image: ImageBitmap;
 }
 
-function PicturePicker({
+export function PicturePicker({
   picture,
   onPicture,
 }: {
@@ -59,7 +58,7 @@ function PicturePicker({
   );
 }
 
-function PictureStage({
+export function PictureStage({
   picture,
   draw,
   onDown,
@@ -131,9 +130,11 @@ export function TakeFromPicture({
 }) {
   const [selection, setSelection] = useState<Selection | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [cutOut, setCutOut] = useState(false);
+  /** whole: the rectangle as it is. shape: only the shape, off its background. color: one color removed everywhere. */
+  const [cutOut, setCutOut] = useState<'whole' | 'shape' | 'color'>('shape');
   const [key, setKey] = useState<string | null>(null);
-  const [tolerance, setTolerance] = useState(0.08);
+  const [tolerance, setTolerance] = useState(0.05);
+  const [keepPart, setKeepPart] = useState<'center' | 'all'>('center');
 
   const rect = useMemo(() => {
     if (!selection || !picture) return null;
@@ -150,11 +151,16 @@ export function TakeFromPicture({
     () => (rect && picture && !dragging ? cutArt(picture.image, rect.x, rect.y, rect.width, rect.height) : null),
     [rect, picture, dragging],
   );
-  const corner = useMemo(() => (plain ? pixelHex(plain.canvas, 0, 0) : null), [plain]);
+  const corner = useMemo(() => (plain ? edgeColor(plain.canvas) : null), [plain]);
   const keyColor = key ?? corner;
   const art = useMemo(
-    () => (plain && cutOut && keyColor ? clearColor(plain, keyColor, tolerance) : plain),
-    [plain, cutOut, keyColor, tolerance],
+    () =>
+      plain && keyColor && cutOut !== 'whole'
+        ? cutOut === 'shape'
+          ? keepShape(plain, keyColor, tolerance, keepPart)
+          : clearColor(plain, keyColor, tolerance)
+        : plain,
+    [plain, cutOut, keyColor, tolerance, keepPart],
   );
 
   return (
@@ -206,8 +212,28 @@ export function TakeFromPicture({
                 </p>
                 {art && <ArtThumb art={art} className="h-32 w-full" />}
                 <div className="mt-3 space-y-3">
-                  <CheckField label="Remove the background color" checked={cutOut} onChange={setCutOut} />
-                  {cutOut && keyColor && (
+                  <div className="space-y-1 text-sm" role="radiogroup" aria-label="What to keep">
+                    {(
+                      [
+                        ['shape', 'Only the shape, off its background'],
+                        ['color', 'Remove one color everywhere'],
+                        ['whole', 'The whole rectangle'],
+                      ] as const
+                    ).map(([value, text]) => (
+                      <label key={value} className="flex items-center gap-2">
+                        <input type="radio" name="cut-out" checked={cutOut === value} onChange={() => setCutOut(value)} />
+                        {text}
+                      </label>
+                    ))}
+                  </div>
+                  {cutOut === 'shape' && (
+                    <CheckField
+                      label="Only the shape in the middle, not bits of its neighbours"
+                      checked={keepPart === 'center'}
+                      onChange={(on) => setKeepPart(on ? 'center' : 'all')}
+                    />
+                  )}
+                  {cutOut !== 'whole' && keyColor && (
                     <>
                       <label className="flex items-center gap-3 text-sm">
                         <input
@@ -216,7 +242,7 @@ export function TakeFromPicture({
                           onChange={(e) => setKey(e.target.value)}
                           className="h-9 w-12 rounded border border-line-strong"
                         />
-                        Color to remove
+                        {cutOut === 'shape' ? 'Background color' : 'Color to remove'}
                       </label>
                       <label className="block text-sm">
                         <span className="flex justify-between">
@@ -242,166 +268,6 @@ export function TakeFromPicture({
           <PanelFooter>
             <Button variant="primary" disabled={!art} onClick={() => art && onTake(art)}>
               Use this part
-            </Button>
-            <Button onClick={onCancel}>Cancel</Button>
-          </PanelFooter>
-        </>
-      }
-    />
-  );
-}
-
-/** Splits a picture of a whole rug into border bands and a field. */
-export function SplitPicture({
-  picture,
-  onPicture,
-  size,
-  replaces,
-  onDone,
-  onCancel,
-}: {
-  picture: Picture | null;
-  onPicture(picture: Picture): void;
-  size: { baseWidth: number; baseHeight: number };
-  /** Number of segments that will be replaced. */
-  replaces: number;
-  onDone(doc: SegmentDoc): void;
-  onCancel(): void;
-}) {
-  const [bands, setBands] = useState<number[]>([]);
-  const [field, setField] = useState<'whole' | 'quarter'>('quarter');
-  const held = useRef<number | null>(null);
-  const image = picture?.image ?? null;
-
-  useEffect(() => {
-    if (image) setBands(suggestBands(image));
-  }, [image]);
-
-  const deepest = image ? Math.floor(Math.min(image.width, image.height) / 2) - 2 : 0;
-  /** How far a point is from the nearest edge. */
-  const depthOf = (p: Point) =>
-    image ? Math.min(p.x, p.y, image.width - p.x, image.height - p.y) : 0;
-  const moveBand = (index: number, depth: number) =>
-    setBands((all) => {
-      const lo = (all[index - 1] ?? 0) + 2;
-      const hi = (all[index + 1] ?? deepest + 2) - 2;
-      return all.map((b, i) => (i === index ? Math.round(clamp(depth, lo, Math.max(lo, hi))) : b));
-    });
-
-  return (
-    <TwoZone
-      canvas={
-        <PictureStage
-          picture={picture}
-          onDown={(p, scale) => {
-            const depth = depthOf(p);
-            const near = bands
-              .map((b, i) => ({ i, off: Math.abs(b - depth) * scale }))
-              .sort((a, b) => a.off - b.off)[0];
-            held.current = near && near.off < 12 ? near.i : null;
-          }}
-          onMove={(p) => {
-            if (held.current !== null) moveBand(held.current, depthOf(p));
-          }}
-          onUp={() => {
-            held.current = null;
-          }}
-          draw={(ctx, view) => {
-            if (!image) return;
-            for (const b of bands) {
-              const box: [number, number, number, number] = [
-                view.x + b * view.scale,
-                view.y + b * view.scale,
-                (image.width - 2 * b) * view.scale,
-                (image.height - 2 * b) * view.scale,
-              ];
-              ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-              ctx.lineWidth = 4;
-              ctx.strokeRect(...box);
-              ctx.strokeStyle = '#2b4479';
-              ctx.lineWidth = 2;
-              ctx.strokeRect(...box);
-            }
-          }}
-        />
-      }
-      panel={
-        <>
-          <PanelBody>
-            <Heading title="Split a rug picture">
-              Each line is where one border ends and the next begins. Drag a line to move it.
-            </Heading>
-            <PicturePicker picture={picture} onPicture={onPicture} />
-            {image && (
-              <>
-                <Group title="Border lines">
-                  {bands.length === 0 && (
-                    <p className="mb-2 text-sm text-muted">No borders found. Add a line where one ends.</p>
-                  )}
-                  <ul className="space-y-2">
-                    {bands.map((b, i) => (
-                      <li key={i} className="flex items-center gap-2 text-sm">
-                        <label className="flex flex-1 items-center gap-2">
-                          <span className="w-14 shrink-0">Line {i + 1}</span>
-                          <input
-                            type="range"
-                            min={2}
-                            max={deepest}
-                            value={b}
-                            onChange={(e) => moveBand(i, Number(e.target.value))}
-                            className="w-full min-w-0"
-                          />
-                          <span className="w-14 shrink-0 text-right">{b} px</span>
-                        </label>
-                        <Button variant="quiet" onClick={() => setBands(bands.filter((_, j) => j !== i))}>
-                          Remove
-                        </Button>
-                      </li>
-                    ))}
-                  </ul>
-                  <Button
-                    className="mt-3"
-                    disabled={(bands.at(-1) ?? 0) + 8 > deepest}
-                    onClick={() => setBands([...bands, Math.min(deepest, Math.round((bands.at(-1) ?? 0) + deepest / 8))])}
-                  >
-                    Add a line
-                  </Button>
-                </Group>
-                <Group title="Middle of the rug">
-                  <div className="space-y-1 text-sm">
-                    {(
-                      [
-                        ['quarter', 'Mirrored quarter that repeats'],
-                        ['whole', 'One piece that stretches'],
-                      ] as const
-                    ).map(([value, text]) => (
-                      <label key={value} className="flex items-center gap-2">
-                        <input
-                          type="radio"
-                          name="split-field"
-                          checked={field === value}
-                          onChange={() => setField(value)}
-                        />
-                        {text}
-                      </label>
-                    ))}
-                  </div>
-                </Group>
-                {replaces > 0 && (
-                  <Notice tone="warn">
-                    This replaces the {replaces} {replaces === 1 ? 'segment' : 'segments'} you have now.
-                  </Notice>
-                )}
-              </>
-            )}
-          </PanelBody>
-          <PanelFooter>
-            <Button
-              variant="primary"
-              disabled={!image}
-              onClick={() => image && onDone(segmentsFromPicture(image, { bands, field }, size))}
-            >
-              Create segments
             </Button>
             <Button onClick={onCancel}>Cancel</Button>
           </PanelFooter>

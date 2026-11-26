@@ -70,6 +70,11 @@ interface AppActions {
   goTo(step: Step): void;
   editDimension(field: DimensionField, value: number): void;
   setUnit(unit: Unit): void;
+  /**
+   * Sets the rug's width and height while designing with segments, which
+   * follow any size by their rules. Step 1 shows the new size.
+   */
+  resizeRug(widthIn: number, heightIn: number): void;
   lockDimensions(): void;
   /** Unlocks step 1 and discards everything downstream. */
   unlockDimensions(): void;
@@ -134,6 +139,21 @@ export const useApp = create<AppState>()((set, get) => {
       set({ dimensions: { ...dimensions, ...applyEdit(dimensions, field, value) } });
     },
     setUnit: (unit) => set({ dimensions: { ...get().dimensions, unit } }),
+    resizeRug: (widthIn, heightIn) => {
+      const { dimensions, draft, design, designFinal } = get();
+      if (!dimensions.locked || designFinal) return;
+      if (widthIn === dimensions.widthIn && heightIn === dimensions.heightIn) return;
+      const next = { ...dimensions, widthIn, heightIn };
+      const d = derive(next);
+      if (gridProblem(d)) return;
+      set({
+        dimensions: next,
+        grid: { columns: d.columns, rows: d.rows },
+        design: { ...design, image: null },
+        draft: fitDraft(draft, null, next),
+        ...NO_MAP,
+      });
+    },
     lockDimensions: () => {
       const { dimensions } = get();
       const d = derive(dimensions);
